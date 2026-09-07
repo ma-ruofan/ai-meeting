@@ -10,6 +10,7 @@ from meeting_assistant.agent import ask_meeting
 from meeting_assistant.audio import import_audio, transcribe
 from meeting_assistant.config import ROOT, Settings
 from meeting_assistant.export import markdown_minutes
+from meeting_assistant.live import STATUS, LiveManager
 from meeting_assistant.llm import ChatClient
 from meeting_assistant.models import AppError, timestamp
 from meeting_assistant.services import generate_minutes, import_sample
@@ -57,6 +58,62 @@ def go_meeting(ident, message=None):
     if message:
         st.session_state["flash"] = message
     st.rerun()
+
+
+@st.cache_resource
+def live_manager(data_dir):
+    return LiveManager(Repository(data_dir))
+
+
+live = live_manager(settings.data_dir)
+
+
+def public_dialogue(snapshot):
+    st.subheader("小K · 公开问答记录")
+    st.caption("参会者身份未区分；小K的回答属于 AI 发言，不能自动视为会议决定。")
+    for item in snapshot.get("public_dialogue", []):
+        with st.container(border=True):
+            st.caption(f"{timestamp(item['question_time'])} · 参会者提问")
+            st.text(item["question"])
+            st.caption("小K · " + STATUS.get(item["status"], item["status"]))
+            if item["answer"]:
+                st.text(item["answer"])
+            if item["answer_start"] is not None:
+                st.caption("播报开始：" + timestamp(item["answer_start"]))
+            if item["evidence_ids"]:
+                st.caption("回答依据：" + "、".join(item["evidence_ids"]))
+                with st.expander("查看回答生成时的原文"):
+                    for segment in item.get("evidence_snapshot", []):
+                        st.caption(segment["segment_id"] + " · " + timestamp(segment["start"]))
+                        st.text(segment["text"])
+            if item["error"]:
+                st.warning(item["error"])
+    if not snapshot.get("public_dialogue"):
+        st.caption("尚无公开问答。")
+
+
+@st.fragment(run_every=2)
+def live_panel(ident):
+    st.subheader("小K · 现场会议")
+    st.info(f"{live.state} · 已收音 {timestamp(live.seconds)}")
+    st.caption(
+        "最长10分钟。查询和播报期间暂停转录，期间声音仍保存在录音中；请等小K说完再发言。关闭网页不会停止收音，请点击结束。"
+    )
+    if live.active:
+        if st.button("结束收音并保存", type="primary", disabled=live.stop.is_set()):
+            live.request_stop()
+            st.rerun(scope="fragment")
+    else:
+        if live.error:
+            st.error(live.error)
+        if st.button("进入纪要工作区", type="primary"):
+            st.rerun()
+    snapshot = repo.snapshot(ident)
+    public_dialogue(snapshot)
+    st.subheader("正在记录的参会者发言")
+    for segment in snapshot["segments"][-12:]:
+        st.caption(f"{segment['segment_id']} · {timestamp(segment['start'])}")
+        st.text(segment["text"])
 
 
 meetings = repo.list_meetings()
@@ -117,6 +174,13 @@ def model_permission(key):
     return True
 
 
+if live.active:
+    if selected != live.meeting_id:
+        st.warning("现场会议正在收音。请先结束收音，再操作其他会议。")
+    live_panel(live.meeting_id)
+    st.stop()
+
+
 if not selected:
     st.markdown(
         '<div class="eyebrow">MEETING WORKSPACE / 会议工作空间</div>', unsafe_allow_html=True
@@ -169,6 +233,29 @@ if not selected:
                 go_meeting(ident, "已载入虚构文字样例；纪要与问答仍需连接真实模型。")
             except Exception as exc:
                 error_message(exc)
+    with st.container(border=True):
+        st.subheader("小K · 开始现场会议")
+        st.write("同一会议室，通过运行程序这台电脑的麦克风收音、扬声器回答。")
+        live_title = st.text_input("现场会议标题", value="小K现场会议", max_chars=150)
+        st.caption("使用系统默认输入和输出设备；请先在系统声音设置中选择会议麦克风和扬声器。")
+        st.caption("说“小K小K”后接问题，以短暂停顿结束。唤醒依赖中文转录，有延迟，也可能漏识别。")
+        consent = st.checkbox("参会者已知悉录音，并同意将小K问答写入公开纪要")
+        cloud_allowed = model_permission("live-cloud-permission")
+        if settings.llm_error():
+            st.info("模型尚未配置：可以测试收音与唤醒，问答将显示配置错误。")
+        voice_ready = bool(find_spec("sounddevice") and find_spec("faster_whisper"))
+        if not voice_ready:
+            st.code("uv sync --extra voice --group dev", language="bash")
+        if st.button(
+            "开始收音 · 唤醒小K",
+            type="primary",
+            disabled=not consent or not cloud_allowed or not voice_ready,
+        ):
+            try:
+                ident = live.start(settings, live_title)
+                go_meeting(ident)
+            except Exception as exc:
+                error_message(exc)
     st.stop()
 
 meeting = repo.meeting(selected)
@@ -179,10 +266,22 @@ st.title(meeting["title"])
 st.caption("已保存在本机 · " + meeting["created_at"].replace("T", " ")[:16] + " UTC")
 if meeting["source_kind"] == "sample":
     st.info("文字开发样例：内容和时间戳为人工编写，没有配套音频。")
+if meeting["source_kind"] == "live":
+    session = repo.live_session(selected)
+    st.caption("现场会议 · " + (session["status"] if session else "已保存"))
+    if session and session["error"]:
+        st.warning(session["error"])
+    public_dialogue(repo.snapshot(selected))
+    st.download_button(
+        "下载完整公开记录（含小K问答）",
+        markdown_minutes(meeting, repo.snapshot(selected)),
+        file_name="public-meeting-record.md",
+        mime="text/markdown",
+    )
 
 a, b, c, d = st.columns(4)
 a.metric(
-    "会议时长" if meeting["source_kind"] == "audio" else "样例时间轴",
+    "样例时间轴" if meeting["source_kind"] == "sample" else "会议时长",
     timestamp(meeting["duration"]),
 )
 b.metric("转录片段", len(segments))
@@ -234,6 +333,7 @@ if page == "转录与校正":
         audio = repo.path(meeting["audio_path"])
         if audio and audio.exists():
             st.audio(str(audio))
+        if audio and audio.exists() and meeting["source_kind"] != "live":
             st.caption(
                 f"转录配置：{settings.asr_model} / {settings.asr_device} / {settings.asr_compute_type}"
             )
@@ -253,6 +353,8 @@ if page == "转录与校正":
                     go_meeting(selected, "转录已保存。")
                 except Exception as exc:
                     error_message(exc)
+        elif meeting["source_kind"] == "live":
+            st.caption("现场转录已保存；小K查询与播报时暂停转录，完整声音保留在录音中。")
         else:
             st.caption("当前会议只包含文字，可直接体验校正、纪要生成与问答。")
         with st.expander("最近转录记录"):

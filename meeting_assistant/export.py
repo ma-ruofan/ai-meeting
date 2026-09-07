@@ -45,6 +45,8 @@ def markdown_minutes(meeting, snapshot, analysis=None):
                 f"{escape(item['deadline_text'] or '未明确')} | {refs(item['evidence_ids'])} |"
             )
     lines += ["", "## 完整转录", ""]
+    if snapshot["source_kind"] == "live":
+        lines += ["> 以下为参会者转录。小K查询与播报期间暂停转录，该时段声音仅保留在录音中。", ""]
     for segment in snapshot["segments"]:
         lines += [
             f'<a id="{segment["segment_id"].lower()}"></a>',
@@ -53,5 +55,35 @@ def markdown_minutes(meeting, snapshot, analysis=None):
             escape(segment["text"]),
             "",
         ]
+    if snapshot.get("public_dialogue"):
+        from .live import STATUS
+
+        lines += ["## 小K公开问答", "", "小K发言属于 AI 回答，不自动构成参会者确认的决定。", ""]
+        for item in snapshot["public_dialogue"]:
+            lines += [
+                f"### {timestamp(item['question_time'])} · 参会者提问",
+                "",
+                escape(item["question"]),
+                "",
+                "**小K · " + STATUS.get(item["status"], escape(item["status"])) + "**",
+                "",
+                escape(item["answer"] or "未生成回答。"),
+                "",
+                "提问片段：" + "、".join(item["question_segment_ids"]),
+                "回答引用（生成时快照）：" + ("、".join(item["evidence_ids"]) or "无"),
+                "",
+            ]
+            if item["answer_start"] is not None:
+                lines += ["播报开始：" + timestamp(item["answer_start"]), ""]
+            if item["answer_end"] is not None:
+                lines += ["播报结束/停止：" + timestamp(item["answer_end"]), ""]
+            if item["error"]:
+                lines += ["状态说明：" + escape(item["error"]), ""]
+            for segment in item.get("evidence_snapshot", []):
+                lines += [
+                    f"原始引用 {segment['segment_id']} · {timestamp(segment['start'])}："
+                    + escape(segment["text"]),
+                    "",
+                ]
     lines += ["---", "AI 结果需人工复核；引用存在不等于内容推断一定正确。", ""]
     return "\n".join(lines)

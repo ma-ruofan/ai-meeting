@@ -29,6 +29,10 @@ class Settings:
     ffprobe: str = "ffprobe"
     max_audio_seconds: int = 600
     max_upload_bytes: int = 100 * 1024 * 1024
+    live_asr_model: str = "small"
+    live_rms_threshold: float = 0.012
+    live_silence_seconds: float = 0.8
+    tts_voice: str = ""
 
     @classmethod
     def load(cls):
@@ -58,6 +62,10 @@ class Settings:
             asr_timeout=int(get("ASR_TIMEOUT_SECONDS", "900")),
             ffmpeg=get("FFMPEG_PATH", "ffmpeg"),
             ffprobe=get("FFPROBE_PATH", "ffprobe"),
+            live_asr_model=get("LIVE_ASR_MODEL", "small"),
+            live_rms_threshold=float(get("LIVE_RMS_THRESHOLD", "0.012")),
+            live_silence_seconds=float(get("LIVE_SILENCE_SECONDS", "0.8")),
+            tts_voice=get("TTS_VOICE"),
         )
 
     def llm_error(self):

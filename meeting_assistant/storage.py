@@ -57,9 +57,28 @@ class Repository:
                     finished_at TEXT, error TEXT, metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
             """)
-            if db.execute("SELECT version FROM schema_version").fetchone()[0] != 1:
+            version = db.execute("SELECT version FROM schema_version").fetchone()[0]
+            if version not in {1, 2}:
                 raise AppError("数据库版本不兼容，请备份后按 README 升级。")
+            # Additive v1 -> v2 migration. Existing transcripts and snapshots stay intact.
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS live_sessions(
+                    id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id),
+                    status TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
+                    error TEXT, metadata_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS public_dialogue(
+                    id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id),
+                    question TEXT NOT NULL, question_time REAL NOT NULL,
+                    question_segment_ids TEXT NOT NULL, context_revision INTEGER NOT NULL,
+                    answer TEXT, answer_start REAL, answer_end REAL,
+                    evidence_ids TEXT NOT NULL DEFAULT '[]', agent_run_id TEXT,
+                    status TEXT NOT NULL, error TEXT
+                );
+                UPDATE schema_version SET version=2;
+            """)
         self.recover()
+        self.recover_live()
 
     @contextmanager
     def connect(self):
@@ -210,7 +229,29 @@ class Repository:
                     (meeting_id,),
                 )
             ]
-        if not segments:
+            dialogue = [
+                self.decode_dialogue(r)
+                for r in db.execute(
+                    "SELECT * FROM public_dialogue WHERE meeting_id=? ORDER BY question_time,rowid",
+                    (meeting_id,),
+                )
+            ]
+            for item in dialogue:
+                item["evidence_snapshot"] = []
+                if item["agent_run_id"]:
+                    run = db.execute(
+                        "SELECT snapshot_json FROM agent_runs WHERE id=? AND meeting_id=?",
+                        (item["agent_run_id"], meeting_id),
+                    ).fetchone()
+                    if run:
+                        original = json.loads(run[0])
+                        item["answer_revision"] = original["revision"]
+                        item["evidence_snapshot"] = [
+                            s
+                            for s in original["segments"]
+                            if s["segment_id"] in item["evidence_ids"]
+                        ]
+        if not segments and meeting["source_kind"] != "live":
             raise AppError("请先转录音频或载入开发样例。")
         return {
             "meeting_id": meeting_id,
@@ -219,7 +260,165 @@ class Repository:
             "segments": segments,
             "source_kind": meeting["source_kind"],
             "audio_path": meeting["audio_path"],
+            "public_dialogue": dialogue,
         }
+
+    def recover_live(self):
+        try:
+            with FileLock(str(self.root / "live.lock"), timeout=0), self.connect() as db:
+                db.execute(
+                    "UPDATE live_sessions SET status='interrupted',ended_at=?,error=? "
+                    "WHERE status IN ('starting','active','stopping')",
+                    (now(), "上次现场会议异常结束，录音可能不完整。"),
+                )
+                rows = db.execute(
+                    "SELECT DISTINCT meeting_id FROM public_dialogue "
+                    "WHERE status IN ('thinking','speaking')"
+                ).fetchall()
+                db.execute(
+                    "UPDATE public_dialogue SET status='interrupted',error=? "
+                    "WHERE status IN ('thinking','speaking')",
+                    ("上次问答中断，未确认播报完成。",),
+                )
+                for row in rows:
+                    db.execute(
+                        "UPDATE meetings SET transcript_revision=transcript_revision+1 WHERE id=?",
+                        (row[0],),
+                    )
+        except Timeout:
+            pass
+
+    def begin_live(self, meeting_id, metadata):
+        ident = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO live_sessions(id,meeting_id,status,started_at,metadata_json) "
+                "VALUES(?,?,'starting',?,?)",
+                (ident, meeting_id, now(), canonical(metadata)),
+            )
+        return ident
+
+    def finish_live(self, ident, status, error=None):
+        with self.connect() as db:
+            db.execute(
+                "UPDATE live_sessions SET status=?,ended_at=?,error=? WHERE id=?",
+                (
+                    status,
+                    now() if status not in {"starting", "active", "stopping"} else None,
+                    error,
+                    ident,
+                ),
+            )
+
+    def live_session(self, meeting_id):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM live_sessions WHERE meeting_id=? ORDER BY rowid DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def append_live_text(self, meeting_id, text, start, end):
+        if not text.strip() or not 0 <= start < end <= 601:
+            raise AppError("现场转录片段无效。")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            n = (
+                db.execute(
+                    "SELECT COALESCE(MAX(CAST(SUBSTR(segment_id,2) AS INTEGER)),0) "
+                    "FROM segments WHERE meeting_id=?",
+                    (meeting_id,),
+                ).fetchone()[0]
+                + 1
+            )
+            segment_id = f"S{n:03d}"
+            db.execute(
+                "INSERT INTO segments(meeting_id,segment_id,start,end,model_text) VALUES(?,?,?,?,?)",
+                (meeting_id, segment_id, start, end, text[:5000]),
+            )
+            db.execute(
+                "UPDATE meetings SET duration=MAX(duration,?),transcript_revision=transcript_revision+1 WHERE id=?",
+                (end, meeting_id),
+            )
+        return segment_id
+
+    def update_duration(self, meeting_id, duration):
+        with self.connect() as db:
+            db.execute(
+                "UPDATE meetings SET duration=MAX(duration,?) WHERE id=?", (duration, meeting_id)
+            )
+
+    @staticmethod
+    def decode_dialogue(row):
+        result = dict(row)
+        for key in ("evidence_ids", "question_segment_ids"):
+            result[key] = json.loads(result[key])
+        return result
+
+    def public_dialogue(self, meeting_id):
+        with self.connect() as db:
+            return [
+                self.decode_dialogue(row)
+                for row in db.execute(
+                    "SELECT * FROM public_dialogue WHERE meeting_id=? ORDER BY question_time,rowid",
+                    (meeting_id,),
+                )
+            ]
+
+    def begin_dialogue(self, meeting_id, question, question_time, segment_ids):
+        ident = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            revision = db.execute(
+                "SELECT transcript_revision FROM meetings WHERE id=?", (meeting_id,)
+            ).fetchone()[0]
+            db.execute(
+                "INSERT INTO public_dialogue(id,meeting_id,question,question_time,question_segment_ids,"
+                "context_revision,status) VALUES(?,?,?,?,?,?,'thinking')",
+                (ident, meeting_id, question, question_time, canonical(segment_ids), revision),
+            )
+            db.execute(
+                "UPDATE meetings SET transcript_revision=transcript_revision+1 WHERE id=?",
+                (meeting_id,),
+            )
+        return ident
+
+    def update_dialogue(
+        self,
+        ident,
+        *,
+        status,
+        answer=None,
+        answer_start=None,
+        answer_end=None,
+        evidence_ids=None,
+        agent_run_id=None,
+        error=None,
+    ):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE public_dialogue SET status=?,answer=COALESCE(?,answer),"
+                "answer_start=COALESCE(?,answer_start),answer_end=COALESCE(?,answer_end),"
+                "evidence_ids=COALESCE(?,evidence_ids),agent_run_id=COALESCE(?,agent_run_id),error=? WHERE id=?",
+                (
+                    status,
+                    answer,
+                    answer_start,
+                    answer_end,
+                    canonical(evidence_ids) if evidence_ids is not None else None,
+                    agent_run_id,
+                    error,
+                    ident,
+                ),
+            )
+            row = db.execute(
+                "SELECT meeting_id FROM public_dialogue WHERE id=?", (ident,)
+            ).fetchone()
+            db.execute(
+                "UPDATE meetings SET transcript_revision=transcript_revision+1 WHERE id=?",
+                (row[0],),
+            )
 
     def begin_analysis(self, snapshot, metadata):
         ident = uuid.uuid4().hex

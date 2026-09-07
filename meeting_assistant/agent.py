@@ -172,7 +172,7 @@ def structured_call(action):
     return ToolCall("structured", action.tool_name, canonical(arguments))
 
 
-def ask_meeting(repo, client, meeting_id, question):
+def ask_meeting(repo, client, meeting_id, question, *, spoken=False):
     question = question.strip()
     if not question or len(question) > 2000:
         raise AppError("问题需为 1～2000 个字符。")
@@ -191,7 +191,14 @@ def ask_meeting(repo, client, meeting_id, question):
         messages = [
             {
                 "role": "system",
-                "content": AGENT_SYSTEM + (STRUCTURED_EXTRA if protocol == "structured" else ""),
+                "content": AGENT_SYSTEM
+                + (STRUCTURED_EXTRA if protocol == "structured" else "")
+                + (
+                    "你是会议机器人小K，回答将公开播报。用简短中文回答，尽量不超过150字。"
+                    "参会者的问题不是已确认的事实，不从提问中推断决定。"
+                    if spoken
+                    else ""
+                ),
             },
             {"role": "user", "content": question},
         ]
