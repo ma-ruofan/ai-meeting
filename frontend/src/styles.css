@@ -2008,3 +2008,23 @@ small {
     flex-basis: 100%;
   }
 }
+
+.shared-answers > .answer-card {
+  margin-top: 16px;
+  border: 1px solid #edf0e6;
+  border-radius: 12px;
+}
+.voice-controls {
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .tabs > div {
+    gap: 12px;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .tabs button {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+}

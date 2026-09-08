@@ -54,6 +54,21 @@ def add(client, path, headers, text="周五完成测试", key="request-first"):
     return response.json()["id"]
 
 
+def shared_answer(app, host, question="测试什么时候完成", key="shared-question"):
+    snapshot = app.state.store.snapshot(host["meeting_id"])
+    result = asyncio.run(Agent(app.state.settings).ask(snapshot, question))
+    return app.state.store.save_answer(
+        host["meeting_id"],
+        host["member_id"],
+        question,
+        result,
+        snapshot["meeting"]["revision"],
+        "mock",
+        True,
+        key,
+    )
+
+
 def test_membership_isolation_and_host_permissions(setup):
     client, app, host, path, headers = setup
     assert client.get(path).status_code == 401
@@ -85,10 +100,8 @@ def test_idempotency_agent_confirmation_revision_and_export(setup):
     client, app, host, path, headers = setup
     ident = add(client, path, headers)
     assert ident == add(client, path, headers)
-    question = {"question": "测试什么时候完成", "request_key": "question-first"}
-    answer = client.post(path + "/ask", headers=headers, json=question)
-    assert answer.status_code == 200, answer.text
-    assert client.post(path + "/ask", headers=headers, json=question).json() == answer.json()
+    aid = shared_answer(app, host)
+    assert shared_answer(app, host) == aid
     snapshot = client.get(path, headers=headers).json()
     assert len(snapshot["utterances"]) == len(snapshot["answers"]) == 1
     assert snapshot["decisions"] == []
@@ -105,7 +118,7 @@ def test_idempotency_agent_confirmation_revision_and_export(setup):
     )
     snapshot = client.get(path, headers=headers).json()
     assert len(snapshot["decisions"]) == 1
-    assert "AI回答与建议" in client.get(path + "/export", headers=headers).text
+    assert "小K语音问答" in client.get(path + "/export", headers=headers).text
     change = {"text": "改为周六完成测试", "speaker": "林", "version": 1}
     assert client.patch(path + "/utterances/" + ident, headers=headers, json=change).status_code == 200
     assert client.patch(path + "/utterances/" + ident, headers=headers, json=change).status_code == 400
@@ -269,9 +282,7 @@ def test_native_audio_worker_timeout_can_recover(tmp_path):
 def test_confirmed_actions_include_current_source_evidence(setup):
     client, app, host, path, headers = setup
     ident = add(client, path, headers)
-    aid = client.post(
-        path + "/ask", headers=headers, json={"question": "什么时候测试", "request_key": "action-question"}
-    ).json()["id"]
+    aid = shared_answer(app, host, "什么时候测试", "action-question")
     client.post(
         path + "/answers/" + aid + "/confirm",
         headers=headers,
@@ -362,3 +373,190 @@ def test_host_manages_device_free_attendees_with_consent_and_isolation(setup):
         client.post(path + "/members", headers=headers, json={"name": "会后", "consent": True}).status_code
         == 400
     )
+
+
+def test_private_chat_isolated_from_members_websocket_export_and_adoption(setup):
+    client, app, host, path, headers = setup
+    add(client, path, headers)
+    code = client.get(path, headers=headers).json()["meeting"]["code"]
+    guest = client.post("/api/join", json={"code": code, "name": "私聊成员", "consent": True}).json()
+    gh = {"Authorization": "Bearer " + guest["token"]}
+    assert client.get(path + "/private-chat").status_code == 401
+    body = {"question": "私密标记SECRET-739：测试何时结束？", "request_key": "same-private-key"}
+    private = client.post(path + "/private-chat", headers=gh, json=body)
+    assert private.status_code == 200
+    assert private.headers["cache-control"] == "no-store"
+    assert client.post(path + "/ask", headers=gh, json=body).json() == private.json()
+    own = client.get(path + "/private-chat", headers=gh)
+    assert len(own.json()["answers"]) == 1
+    assert own.headers["cache-control"] == "no-store"
+    assert client.get(path + "/private-chat", headers=headers).json()["answers"] == []
+    assert client.post(path + "/ask", headers=headers, json={**body, "spoken": True}).status_code == 422
+    assert (
+        client.post(
+            path + "/private-chat", headers=gh, json={**body, "member_id": host["member_id"]}
+        ).status_code
+        == 422
+    )
+    # Idempotency keys are scoped to a participant, never shared between users.
+    other = client.post(
+        path + "/private-chat", headers=headers, json={**body, "question": "主持人个人问题"}
+    ).json()
+    assert other["id"] != private.json()["id"]
+    for auth in (headers, gh):
+        snapshot = client.get(path, headers=auth)
+        assert "SECRET-739" not in snapshot.text and snapshot.json()["answers"] == []
+        assert "SECRET-739" not in client.get(path + "/export", headers=auth).text
+    with client.websocket_connect("/ws/meetings/" + host["meeting_id"]) as ws:
+        ws.send_json({"token": host["token"]})
+        assert "SECRET-739" not in str(ws.receive_json())
+        ws.send_text("sync")
+        assert "SECRET-739" not in str(ws.receive_json())
+    assert (
+        client.post(
+            path + "/answers/" + private.json()["id"] + "/confirm",
+            headers=headers,
+            json={"text": "不允许把私聊采纳到公共纪要"},
+        ).status_code
+        == 400
+    )
+    assert client.post(path + "/summary", headers=headers, json={}).status_code == 200
+    assert "SECRET-739" not in client.get(path, headers=headers).text
+    mid = host["meeting_id"]
+    assert len(Store(app.state.settings.data_dir).private_answers(mid, guest["member_id"])) == 1
+    shared_id = shared_answer(app, host)
+    assert client.post(path + "/end", headers=headers).status_code == 200
+    for auth in (headers, gh):
+        assert client.get(path + "/private-chat", headers=auth).json()["answers"] == []
+        assert client.post(path + "/private-chat", headers=auth, json=body).status_code == 409
+    reopened = Store(app.state.settings.data_dir)
+    with reopened.connect() as db:
+        assert (
+            db.execute("SELECT count(*) FROM private_answers WHERE meeting_id=?", (mid,)).fetchone()[0] == 0
+        )
+    assert reopened.snapshot(mid)["answers"][0]["id"] == shared_id
+
+
+def test_private_context_reads_voice_and_summary_but_voice_cannot_read_private(setup):
+    client, app, host, path, headers = setup
+    ident = add(client, path, headers)
+    store, mid = app.state.store, host["meeting_id"]
+    voice_id = store.save_answer(
+        mid,
+        host["member_id"],
+        "小K语音建议是什么",
+        {
+            "answer": "VOICE-CONTEXT-487：建议使用轮流发言测试。",
+            "citations": [{"id": ident, "version": 1}],
+            "trace": [],
+            "status": "succeeded",
+        },
+        1,
+        "mock",
+        True,
+        "voice-source",
+    )
+    store.save_summary(
+        mid,
+        {"overview": "SUMMARY-CONTEXT-512", "highlights": [], "proposed_actions": [], "citations": [ident]},
+        1,
+        "mock",
+    )
+    store.save_private_answer(
+        mid,
+        host["member_id"],
+        "我的私人问题SECRET-123",
+        {"answer": "个人回复", "citations": [], "trace": [], "status": "succeeded"},
+        1,
+        "mock",
+        "private-source",
+    )
+    snapshot = store.snapshot(mid)
+    public_tools = Tools(snapshot)
+    with pytest.raises(ValueError):
+        public_tools.execute("get_utterances", {"ids": [voice_id]})
+    private_snapshot = {**snapshot, "private_history": store.private_answers(mid, host["member_id"])}
+    private_tools = Tools(private_snapshot)
+    voice = private_tools.execute("get_utterances", {"ids": [voice_id]})["utterances"][0]
+    assert voice["source"] == "ai_voice" and "VOICE-CONTEXT-487" in voice["text"]
+    summ = private_tools.execute("get_utterances", {"ids": [snapshot["summaries"][0]["id"]]})
+    assert "SUMMARY-CONTEXT-512" in str(summ)
+    with pytest.raises(ValueError):
+        private_tools.execute("get_utterances", {"ids": [private_snapshot["private_history"][0]["id"]]})
+
+    class CaptureClient:
+        def __init__(self, target):
+            self.messages = []
+            self.target = target
+
+        async def complete(self, messages):
+            self.messages = list(messages)
+            if len([m for m in messages if m["role"] == "assistant"]) == 0:
+                return {"kind": "tool", "tool": "get_utterances", "arguments": {"ids": [self.target]}}
+            return {"kind": "final", "answer": "根据可见上下文回答", "citations": [self.target]}
+
+    private_model = CaptureClient(voice_id)
+    result = asyncio.run(
+        Agent(Settings(llm_mode="local"), private_model).ask(private_snapshot, "你刚才说什么")
+    )
+    assert result["status"] == "succeeded"
+    assert "SECRET-123" in str(private_model.messages) and "VOICE-CONTEXT-487" in str(private_model.messages)
+    public_model = CaptureClient(ident)
+    asyncio.run(Agent(Settings(llm_mode="local"), public_model).ask(snapshot, "测试时间"))
+    assert "SECRET-123" not in str(public_model.messages)
+    summary = asyncio.run(Agent(Settings()).summarize(snapshot))
+    assert "VOICE-CONTEXT-487" in str(summary) and "SECRET-123" not in str(summary)
+
+
+def test_ending_meeting_cancels_inflight_private_chat_without_recreating_records(setup, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    client, app, host, path, headers = setup
+    started = threading.Event()
+
+    async def slow(self, snapshot, question):
+        started.set()
+        await asyncio.sleep(60)
+        return {"answer": "LATE-PRIVATE", "citations": [], "trace": [], "status": "succeeded"}
+
+    monkeypatch.setattr(Agent, "ask", slow)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            client.post,
+            path + "/private-chat",
+            headers=headers,
+            json={"question": "等待回答", "request_key": "slow-private"},
+        )
+        assert started.wait(3)
+        assert client.get(path, headers=headers).json()["runtime"]["busy"] is False
+        assert client.post(path + "/end", headers=headers).status_code == 200
+        assert future.result(timeout=3).status_code == 409
+    assert client.get(path + "/private-chat", headers=headers).json()["answers"] == []
+    with pytest.raises(ValueError, match="会议已结束"):
+        app.state.store.save_private_answer(
+            host["meeting_id"], host["member_id"], "late", {}, 0, "mock", "late-key"
+        )
+
+
+def test_migration_removes_legacy_text_answers_from_shared_records(tmp_path):
+    store = Store(tmp_path)
+    active, ended = store.create("进行中", "a"), store.create("已结束", "b")
+    result = {"answer": "旧文字回答", "citations": [], "trace": [], "status": "mock"}
+    ids = []
+    for session in (active, ended):
+        ident = store.save_answer(
+            session["meeting_id"], session["member_id"], "旧文字问题", result, 0, "mock", True, "old"
+        )
+        store.confirm(session["meeting_id"], ident, session["member_id"], "旧文字采纳", "action")
+        ids.append(ident)
+    with store.connect() as db:
+        db.execute("UPDATE answers SET spoken=0")
+    store.set_status(ended["meeting_id"], "ended")
+    migrated = Store(tmp_path)
+    assert migrated.private_answers(active["meeting_id"], active["member_id"])[0]["id"] == ids[0]
+    for session in (active, ended):
+        snap = migrated.snapshot(session["meeting_id"])
+        assert snap["answers"] == [] and snap["decisions"] == []
+    assert migrated.private_answers(ended["meeting_id"], ended["member_id"]) == []
+    assert len(Store(tmp_path).private_answers(active["meeting_id"], active["member_id"])) == 1

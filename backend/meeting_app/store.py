@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS answers(
  citations TEXT NOT NULL, trace TEXT NOT NULL, revision INTEGER NOT NULL,
  mode TEXT NOT NULL, status TEXT NOT NULL, spoken INTEGER NOT NULL,
  request_key TEXT NOT NULL, created REAL NOT NULL, UNIQUE(meeting_id,request_key));
+CREATE TABLE IF NOT EXISTS private_answers(
+ id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+ member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+ question TEXT NOT NULL, result TEXT NOT NULL, revision INTEGER NOT NULL,
+ mode TEXT NOT NULL, request_key TEXT NOT NULL, created REAL NOT NULL,
+ UNIQUE(meeting_id,member_id,request_key));
 CREATE TABLE IF NOT EXISTS decisions(
  id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
  answer_id TEXT NOT NULL REFERENCES answers(id) ON DELETE CASCADE,
@@ -73,6 +79,34 @@ class Store:
         self.db = root / "meetings.sqlite3"
         with self.connect() as db:
             db.executescript(SCHEMA)
+            # Migrate old text questions out of the shared meeting record. Never broadcast them again.
+            for row in db.execute(
+                "SELECT a.* FROM answers a JOIN meetings m ON m.id=a.meeting_id WHERE a.spoken=0 AND m.status!='ended'"
+            ).fetchall():
+                result = {
+                    "answer": row["answer"],
+                    "citations": json.loads(row["citations"]),
+                    "trace": json.loads(row["trace"]),
+                    "status": row["status"],
+                }
+                db.execute(
+                    "INSERT OR IGNORE INTO private_answers VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        row["id"],
+                        row["meeting_id"],
+                        row["member_id"],
+                        row["question"],
+                        encode(result),
+                        row["revision"],
+                        row["mode"],
+                        row["request_key"],
+                        row["created"],
+                    ),
+                )
+            db.execute("DELETE FROM answers WHERE spoken=0")
+            db.execute(
+                "DELETE FROM private_answers WHERE meeting_id IN (SELECT id FROM meetings WHERE status='ended')"
+            )
             db.execute(
                 "UPDATE jobs SET status='failed',error='服务重启，音频已保留，可重试' WHERE status IN ('queued','running')"
             )
@@ -239,9 +273,55 @@ class Store:
     def set_status(self, mid, status):
         with self.connect() as db:
             db.execute("UPDATE meetings SET status=? WHERE id=?", (status, mid))
+            if status == "ended":
+                db.execute("DELETE FROM private_answers WHERE meeting_id=?", (mid,))
             self.event(db, mid, "meeting.status")
 
+    def private_answers(self, mid, member):
+        with self.connect() as db:
+            meeting = db.execute("SELECT status,revision FROM meetings WHERE id=?", (mid,)).fetchone()
+            if not meeting or meeting["status"] == "ended":
+                return []
+            rows = db.execute(
+                "SELECT * FROM private_answers WHERE meeting_id=? AND member_id=? ORDER BY created",
+                (mid, member),
+            ).fetchall()
+            return [
+                {
+                    "id": r["id"],
+                    "question": r["question"],
+                    **json.loads(r["result"]),
+                    "mode": r["mode"],
+                    "created": r["created"],
+                    "request_key": r["request_key"],
+                    "spoken": False,
+                    "stale": r["revision"] != meeting["revision"],
+                }
+                for r in rows
+            ]
+
+    def save_private_answer(self, mid, member, question, result, revision, mode, key):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            meeting = db.execute("SELECT status FROM meetings WHERE id=?", (mid,)).fetchone()
+            if not meeting or meeting["status"] == "ended":
+                raise ValueError("会议已结束，私聊已清除，本次回答不再保存")
+            old = db.execute(
+                "SELECT id FROM private_answers WHERE meeting_id=? AND member_id=? AND request_key=?",
+                (mid, member, key),
+            ).fetchone()
+            if old:
+                return old[0]
+            ident = uid()
+            db.execute(
+                "INSERT INTO private_answers VALUES(?,?,?,?,?,?,?,?,?)",
+                (ident, mid, member, question, encode(result), revision, mode, key, time.time()),
+            )
+            return ident
+
     def save_answer(self, mid, member, question, result, revision, mode, spoken, key):
+        if not spoken:
+            raise ValueError("文字问答只能写入私聊")
         with self.connect() as db:
             old = db.execute(
                 "SELECT id FROM answers WHERE meeting_id=? AND request_key=?", (mid, key)

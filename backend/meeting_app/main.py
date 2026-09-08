@@ -68,7 +68,10 @@ class Edit(Strict):
 class Ask(Strict):
     question: str = Field(min_length=1, max_length=1000)
     request_key: str = Field(min_length=8, max_length=100)
-    spoken: bool = False
+
+
+class VoiceAsk(Ask):
+    spoken: Literal[True] = True
 
 
 class Confirm(Strict):
@@ -88,6 +91,7 @@ class RoomRuntime:
     answer_id: str | None = None
     busy: bool = False
     tasks: set = field(default_factory=set)
+    private_tasks: dict = field(default_factory=dict)
     reset_audio: int = 0
     speaking_until: float = 0
 
@@ -106,7 +110,7 @@ def create_app(settings=None, agent=None, speech=None):
     @asynccontextmanager
     async def lifespan(app):
         yield
-        tasks = [task for r in rooms.values() for task in r.tasks]
+        tasks = [task for r in rooms.values() for task in [*r.tasks, *r.private_tasks.values()]]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -176,9 +180,10 @@ def create_app(settings=None, agent=None, speech=None):
 
     def require_ready(mid):
         if store.snapshot(mid)["meeting"]["status"] == "ended":
-            raise HTTPException(409, "会议已结束；仍可查看、问答和导出")
+            raise HTTPException(409, "会议已结束；私聊已清除，仍可查看共享记录和导出")
 
     async def run_ask(mid, current, body):
+        require_ready(mid)
         r = room(mid)
         if r.busy:
             raise HTTPException(409, "小K正在处理上一项请求")
@@ -269,11 +274,45 @@ def create_app(settings=None, agent=None, speech=None):
         await publish(mid)
         return {"ok": True}
 
+    @app.get("/api/meetings/{mid}/private-chat")
+    def private_chat(mid: str, response: Response, current=Depends(member)):
+        response.headers["Cache-Control"] = "no-store"
+        return {"answers": store.private_answers(mid, current["id"])}
+
     @app.post("/api/meetings/{mid}/ask")
-    async def ask(mid: str, body: Ask, current=Depends(member)):
-        if body.spoken and current["role"] != "host":
-            raise HTTPException(403, "语音播报由主设备发起")
-        return await run_ask(mid, current, body)
+    @app.post("/api/meetings/{mid}/private-chat")
+    async def ask(mid: str, body: Ask, response: Response, current=Depends(member)):
+        require_ready(mid)
+        response.headers["Cache-Control"] = "no-store"
+        r, ident = room(mid), current["id"]
+        if ident in r.private_tasks:
+            raise HTTPException(409, "你的上一条私聊仍在处理中")
+        history = store.private_answers(mid, ident)
+        prior = next((a for a in history if a["request_key"] == body.request_key), None)
+        if prior:
+            return {"id": prior["id"]}
+        r.private_tasks[ident] = asyncio.current_task()
+        try:
+            context = store.snapshot(mid)
+            context["private_history"] = history[-12:]
+            result = await agent.ask(context, body.question)
+            try:
+                answer_id = store.save_private_answer(
+                    mid,
+                    ident,
+                    body.question,
+                    result,
+                    context["meeting"]["revision"],
+                    settings.llm_mode,
+                    body.request_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return {"id": answer_id}
+        except asyncio.CancelledError:
+            raise HTTPException(409, "会议已结束或服务已停止，私聊请求已取消") from None
+        finally:
+            r.private_tasks.pop(ident, None)
 
     @app.post("/api/meetings/{mid}/answers/{ident}/confirm")
     async def confirm(mid: str, ident: str, body: Confirm, current=Depends(host)):
@@ -303,6 +342,8 @@ def create_app(settings=None, agent=None, speech=None):
         if r.audio_socket or r.tasks or r.busy:
             raise HTTPException(409, "请先停止录音并等待正在处理的任务完成")
         store.set_status(mid, "ended")
+        for task in list(r.private_tasks.values()):
+            task.cancel()
         await publish(mid)
         return {"ok": True}
 
@@ -316,6 +357,8 @@ def create_app(settings=None, agent=None, speech=None):
         if folder.exists():
             shutil.rmtree(folder)
         store.delete(mid)
+        for task in list(r.private_tasks.values()):
+            task.cancel()
         await publish(mid)
         for ws in list(r.connections):
             await ws.close(code=1000)
@@ -486,11 +529,12 @@ def create_app(settings=None, agent=None, speech=None):
             summ = s["summaries"][-1]
             lines += ["依据已变化，请复核" if summ["stale"] else "待人工复核", summ["data"]["overview"], ""]
             lines += ["- " + x for x in summ["data"]["highlights"]]
-        lines += ["", "## AI回答与建议（不自动构成决定）", ""]
+        lines += ["", "## 小K语音问答（共享记录，不自动构成决定）", ""]
         confirmed = {d["answer_id"] for d in s["decisions"]}
         for a in s["answers"]:
             lines += [
                 f"### 问：{a['question']}",
+                f"记录时间（Unix秒）：{a['created']:.3f}",
                 f"模式：{a['mode']}；状态：{a['status']}；"
                 + ("已采纳" if a["id"] in confirmed else "未采纳"),
                 "依据已变化" if a["stale"] else "",
@@ -590,9 +634,7 @@ def create_app(settings=None, agent=None, speech=None):
                         question = "".join(s["text"] for s in result["segments"])
                         question = re.sub(r"^(.*?小[ Kk开凯克]+){1,2}[，,。\s]*", "", question).strip()
                         if question:
-                            await run_ask(
-                                mid, current, Ask(question=question[:1000], request_key=key, spoken=True)
-                            )
+                            await run_ask(mid, current, VoiceAsk(question=question[:1000], request_key=key))
                         else:
                             r.voice_state = "listening"
                             await publish(mid)

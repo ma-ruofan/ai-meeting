@@ -141,6 +141,50 @@ export default function App() {
   const [pending, setPending] = useState(false);
   const [connected, setConnected] = useState(false);
   const [question, setQuestion] = useState("");
+  const [privateChat, setPrivateChat] = useState<{
+    token: string;
+    answers: Answer[];
+  } | null>(null);
+  const [privatePendingToken, setPrivatePendingToken] = useState<string | null>(
+    null,
+  );
+  const privateScope =
+    active &&
+    snapshot?.meeting.id === active.meeting_id &&
+    snapshot.meeting.status !== "ended"
+      ? active.token
+      : "";
+  const currentPrivateScope = useRef(privateScope);
+  currentPrivateScope.current = privateScope;
+  const privatePending = !!active && privatePendingToken === active.token;
+  const privateAnswers =
+    privateChat?.token === privateScope ? privateChat.answers : [];
+  useEffect(() => {
+    if (!privateScope || !active) {
+      setQuestion("");
+      setPrivateChat(null);
+      return;
+    }
+    let gone = false;
+    const refresh = async () => {
+      try {
+        const data = await api<{ answers: Answer[] }>(
+          roomPath(active) + "/private-chat",
+          active,
+        );
+        if (!gone && currentPrivateScope.current === active.token)
+          setPrivateChat({ token: active.token, answers: data.answers });
+      } catch (e) {
+        if (!gone) setError(e instanceof Error ? e.message : "无法读取私聊");
+      }
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 4000);
+    return () => {
+      gone = true;
+      clearInterval(timer);
+    };
+  }, [privateScope, snapshot?.meeting.revision]);
   const [recording, setRecording] = useState(false);
   const [level, setLevel] = useState(0);
   const [query, setQuery] = useState("");
@@ -265,6 +309,8 @@ export default function App() {
     audioWs.current = null;
     setSnapshot(null);
     setActive(session);
+    setPrivateChat(null);
+    setQuestion("");
     setError("");
     setTab("records");
     setQuery("");
@@ -342,12 +388,31 @@ export default function App() {
   async function ask(e?: FormEvent, quick?: string) {
     e?.preventDefault();
     const q = (quick ?? question).trim();
-    if (!active || !q) return;
-    await perform(async () => {
-      await api(path + "/ask", active, { question: q, request_key: uid() });
-      setQuestion("");
-    });
+    if (!active || !q || !privateScope || privatePending) return;
+    const session = active;
+    setPrivatePendingToken(session.token);
+    setError("");
+    try {
+      await api(roomPath(session) + "/private-chat", session, {
+        question: q,
+        request_key: uid(),
+      });
+      const data = await api<{ answers: Answer[] }>(
+        roomPath(session) + "/private-chat",
+        session,
+      );
+      if (currentPrivateScope.current === session.token) {
+        setPrivateChat({ token: session.token, answers: data.answers });
+        setQuestion("");
+      }
+    } catch (e) {
+      if (currentPrivateScope.current === session.token)
+        setError(e instanceof Error ? e.message : "私聊失败");
+    } finally {
+      setPrivatePendingToken((old) => (old === session.token ? null : old));
+    }
   }
+
   async function exportMeeting() {
     if (!active) return;
     await perform(async () => {
@@ -550,19 +615,74 @@ export default function App() {
       (u) => !query || u.text.includes(query) || u.speaker.includes(query),
     ) ?? [];
   const jump = (id: string) => {
-    setTab("records");
+    const isVoice = snapshot?.answers.some((a) => a.id === id);
+    const isSummary = snapshot?.summaries.some((a) => a.id === id);
+    setTab(isVoice ? "voice-answers" : isSummary ? "summary" : "records");
     setQuery("");
     setTimeout(() => {
       document
-        .getElementById("u-" + id)
+        .getElementById((isVoice ? "a-" : isSummary ? "summary-" : "u-") + id)
         ?.scrollIntoView({ behavior: "smooth", block: "center" });
       document
-        .getElementById("u-" + id)
+        .getElementById((isVoice ? "a-" : isSummary ? "summary-" : "u-") + id)
         ?.animate([{ background: "#dfeccf" }, { background: "transparent" }], {
           duration: 1800,
         });
     }, 100);
   };
+
+  const renderAnswer = (a: Answer, shared: boolean) => (
+    <article
+      className={`answer-card ${shared ? "shared-answer" : "private-answer"}`}
+      id={shared ? "a-" + a.id : undefined}
+      key={a.id}
+    >
+      <div className="question-bubble">{a.question}</div>
+      <div className="answer-meta">
+        <Sparkles size={14} />
+        <strong>{shared ? "小K · 语音问答" : "小K · 私聊"}</strong>
+        <span>{a.mode === "mock" ? "模拟回答" : "AI回答"}</span>
+        {a.spoken && <Volume2 size={13} />}
+      </div>
+      <p className={a.status === "failed" ? "failed" : ""}>{a.answer}</p>
+      {a.stale && <span className="stale">原文已变化，请重新提问后复核</span>}
+      <div className="citations">
+        {a.citations.map((c, i) => (
+          <button key={c.id} onClick={() => jump(c.id)}>
+            <Link2 size={12} />
+            依据 {i + 1}
+          </button>
+        ))}
+      </div>
+      <details className="trace">
+        <summary>
+          工具执行轨迹 · {a.trace.filter((t) => t.tool).length} 次调用
+        </summary>
+        {a.trace.map((t, i) => (
+          <div key={i}>
+            <strong>{String(t.tool ?? "执行失败")}</strong>
+            <pre>{JSON.stringify(t, null, 2)}</pre>
+          </div>
+        ))}
+      </details>
+      {shared &&
+        host &&
+        a.status !== "failed" &&
+        a.citations.length > 0 &&
+        !a.stale &&
+        (snapshot?.decisions.some((d) => d.answer_id === a.id) ? (
+          <span className="adopted">
+            <CheckCircle2 size={13} />
+            已采纳，见会后纪要
+          </span>
+        ) : (
+          <button className="text-button" onClick={() => setConfirming(a)}>
+            <Check size={14} />
+            复核并采纳
+          </button>
+        ))}
+    </article>
+  );
 
   return (
     <div className="app">
@@ -894,6 +1014,7 @@ export default function App() {
                 {[
                   ["records", "会议记录", FileText],
                   ["voices", "参会者与声纹", Fingerprint],
+                  ["voice-answers", "语音问答", Volume2],
                   ["summary", "会后纪要", Clipboard],
                 ].map(([id, label, Icon]) => {
                   const Component = Icon as typeof FileText;
@@ -1122,6 +1243,22 @@ export default function App() {
                       )}
                     </footer>
                   </>
+                ) : tab === "voice-answers" ? (
+                  <div className="summary-content shared-answers">
+                    <h2>小K语音问答</h2>
+                    <p className="muted">
+                      语音唤醒或“语音提问”产生的问答对全体参会者可见，自动保存在会议纪要中。AI建议仍需复核才能成为决定。
+                    </p>
+                    {snapshot.answers.length ? (
+                      snapshot.answers.map((a) => renderAnswer(a, true))
+                    ) : (
+                      <Empty
+                        icon={<Volume2 size={26} />}
+                        title="还没有共享语音问答"
+                        text="主设备开始录音后，说“小K小K”并提问。"
+                      />
+                    )}
+                  </div>
                 ) : tab === "voices" ? (
                   <div className="voices-content">
                     <div className="section-heading">
@@ -1330,7 +1467,9 @@ export default function App() {
                             </span>
                           )}
                         </div>
-                        <p className="overview">{latest.data.overview}</p>
+                        <p className="overview" id={"summary-" + latest.id}>
+                          {latest.data.overview}
+                        </p>
                         <h3>讨论要点</h3>
                         <ul className="highlights">
                           {latest.data.highlights.map((x, i) => (
@@ -1363,6 +1502,13 @@ export default function App() {
                         text="有了会议记录，就可以生成摘要和待办建议。"
                       />
                     )}
+                    <div className="shared-answers">
+                      <h3>小K语音问答 · 纪要附录</h3>
+                      <p className="muted">
+                        自动保存并随纪要导出；私聊不包含在内。
+                      </p>
+                      {snapshot.answers.map((a) => renderAnswer(a, true))}
+                    </div>
                     <div className="decisions">
                       <h3>
                         <CheckCircle2 size={19} />
@@ -1408,22 +1554,26 @@ export default function App() {
                     <Sparkles size={21} />
                   </span>
                   <div>
-                    <h2>小K 在这里</h2>
-                    <p>
-                      {voiceLabels[snapshot.runtime.voice_state] ??
-                        "你的会议助理"}
-                    </p>
+                    <h2>与小K私聊</h2>
+                    <p>仅本人可见 · 不写入纪要</p>
                   </div>
                   <span className="status-dot" />
                 </header>
                 <div className="assistant-mode">
-                  <span>MEETING AGENT</span>
+                  <span>PRIVATE CHAT</span>
                   <span>
                     {snapshot.model_mode === "mock" ? "模拟模式" : "真实模型"}
                   </span>
                 </div>
                 <div className="answers">
-                  {snapshot.answers.length === 0 ? (
+                  {!privateScope ? (
+                    <div className="assistant-welcome">
+                      <h3>私聊已关闭</h3>
+                      <p>
+                        会议结束后，私聊内容已自动删除。共享语音问答仍保留在会议纪要中。
+                      </p>
+                    </div>
+                  ) : privateAnswers.length === 0 ? (
                     <div className="assistant-welcome">
                       <div className="assistant-art">
                         <span />
@@ -1433,9 +1583,9 @@ export default function App() {
                       </div>
                       <h3>有问题，随时问我。</h3>
                       <p>
-                        我会查找这场会议的记录，
+                        我能读取会议记录、纪要和共享语音问答，
                         <br />
-                        把答案和依据一起交给你。
+                        私聊仅你可见，会议结束后自动删除。
                       </p>
                       <div className="suggestions">
                         {[
@@ -1445,7 +1595,7 @@ export default function App() {
                         ].map((q) => (
                           <button
                             key={q}
-                            disabled={pending || snapshot.runtime.busy}
+                            disabled={privatePending || !privateScope}
                             onClick={() => void ask(undefined, q)}
                           >
                             {q}
@@ -1460,71 +1610,11 @@ export default function App() {
                       </small>
                     </div>
                   ) : (
-                    snapshot.answers.map((a) => (
-                      <article className="answer-card" key={a.id}>
-                        <div className="question-bubble">{a.question}</div>
-                        <div className="answer-meta">
-                          <Sparkles size={14} />
-                          <strong>小K</strong>
-                          <span>
-                            {a.mode === "mock" ? "模拟回答" : "AI回答"}
-                          </span>
-                          {a.spoken && <Volume2 size={13} />}
-                        </div>
-                        <p className={a.status === "failed" ? "failed" : ""}>
-                          {a.answer}
-                        </p>
-                        {a.stale && (
-                          <span className="stale">
-                            原文已变化，请重新提问后复核
-                          </span>
-                        )}
-                        <div className="citations">
-                          {a.citations.map((c, i) => (
-                            <button key={c.id} onClick={() => jump(c.id)}>
-                              <Link2 size={12} />
-                              依据 {i + 1}
-                            </button>
-                          ))}
-                        </div>
-                        <details className="trace">
-                          <summary>
-                            工具执行轨迹 ·{" "}
-                            {a.trace.filter((t) => t.tool).length} 次调用
-                          </summary>
-                          {a.trace.map((t, i) => (
-                            <div key={i}>
-                              <strong>{String(t.tool ?? "执行失败")}</strong>
-                              <pre>{JSON.stringify(t, null, 2)}</pre>
-                            </div>
-                          ))}
-                        </details>
-                        {host &&
-                          a.status !== "failed" &&
-                          a.citations.length > 0 &&
-                          !a.stale &&
-                          (snapshot.decisions.some(
-                            (d) => d.answer_id === a.id,
-                          ) ? (
-                            <span className="adopted">
-                              <CheckCircle2 size={13} />
-                              已采纳，见会后纪要
-                            </span>
-                          ) : (
-                            <button
-                              className="text-button"
-                              onClick={() => setConfirming(a)}
-                            >
-                              <Check size={14} />
-                              复核并采纳
-                            </button>
-                          ))}
-                      </article>
-                    ))
+                    privateAnswers.map((a) => renderAnswer(a, false))
                   )}
                 </div>
                 <div className="ask-footer">
-                  {snapshot.runtime.busy && (
+                  {privatePending && (
                     <div className="thinking">
                       <Loader2 size={14} className="spin" />
                       正在执行，请稍候…
@@ -1532,6 +1622,12 @@ export default function App() {
                   )}
                   {host && recording && (
                     <div className="voice-controls">
+                      {tab !== "records" && (
+                        <button onClick={() => void stopRecording()}>
+                          <Square size={13} />
+                          结束录音
+                        </button>
+                      )}
                       {snapshot.runtime.voice_state === "speaking" ? (
                         <button onClick={stopPlayback}>
                           <Square size={13} />
@@ -1552,13 +1648,18 @@ export default function App() {
                           语音提问
                         </button>
                       )}
-                      <span>也可以说「小K小K」</span>
+                      <span>语音问答会共享并记入纪要</span>
                     </div>
                   )}
                   <form className="ask-box" onSubmit={(e) => void ask(e)}>
                     <textarea
                       aria-label="向小K提问"
-                      placeholder="问问这场会议…"
+                      placeholder={
+                        privateScope
+                          ? "私聊小K，会议结束后自动删除…"
+                          : "会议已结束"
+                      }
+                      disabled={!privateScope || privatePending}
                       rows={2}
                       value={question}
                       onChange={(e) => setQuestion(e.target.value)}
@@ -1578,14 +1679,14 @@ export default function App() {
                       <button
                         aria-label="发送问题"
                         disabled={
-                          !question.trim() || pending || snapshot.runtime.busy
+                          !question.trim() || privatePending || !privateScope
                         }
                       >
                         <Send size={16} />
                       </button>
                     </div>
                   </form>
-                  <p>AI回答是建议，采纳后才成为正式决定。</p>
+                  <p>私聊不共享、不导出，会议结束后自动删除。</p>
                 </div>
               </aside>
             </div>
