@@ -132,6 +132,7 @@ export default function App() {
     | "invite"
     | "manual"
     | "voice"
+    | "attendee"
     | "delete"
     | "settings"
   >(null);
@@ -145,6 +146,10 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<Utterance | null>(null);
   const [confirming, setConfirming] = useState<Answer | null>(null);
+  const [voiceTarget, setVoiceTarget] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [voiceBlob, setVoiceBlob] = useState<Blob | null>(null);
   const [voiceSeconds, setVoiceSeconds] = useState(0);
@@ -521,7 +526,14 @@ export default function App() {
       return;
     }
     await perform(async () => {
-      await api(path + "/voiceprint", active, form);
+      await api(
+        path +
+          (voiceTarget
+            ? `/members/${voiceTarget.id}/voiceprint`
+            : "/voiceprint"),
+        active,
+        form,
+      );
       setModal(null);
       setVoiceBlob(null);
       setNotice("声纹已登记，仅用于本场会议匹配");
@@ -1124,9 +1136,23 @@ export default function App() {
                     <div className="voice-note">
                       <ShieldCheck size={18} />
                       <p>
-                        声纹只保存在主电脑，用于本场发言标注。每个人使用自己的加入身份登记，可随时撤回或删除。
+                        声纹只保存在主电脑，用于本场发言标注。没有设备的人可由主持人添加，并在本人同意后代为登记、撤回或删除声纹。
                       </p>
                     </div>
+                    {host && (
+                      <button
+                        className="secondary"
+                        disabled={
+                          pending ||
+                          snapshot.meeting.status === "ended" ||
+                          snapshot.members.length >= 12
+                        }
+                        onClick={() => setModal("attendee")}
+                      >
+                        <Plus size={16} />
+                        添加现场参会者
+                      </button>
+                    )}
                     {snapshot.members.map((m, i) => {
                       const voice = snapshot.voiceprints.find(
                         (v) => v.member_id === m.id,
@@ -1140,7 +1166,12 @@ export default function App() {
                               {m.id === active.member_id && <span>（我）</span>}
                             </strong>
                             <small>
-                              {m.role === "host" ? "主持人" : "参会者"} ·{" "}
+                              {m.role === "host"
+                                ? "主持人"
+                                : m.role === "attendee"
+                                  ? "现场参会者 · 无需设备"
+                                  : "参会者"}{" "}
+                              ·{" "}
                               {voice
                                 ? voice.enabled
                                   ? "声纹已登记 · 本场启用"
@@ -1148,13 +1179,71 @@ export default function App() {
                                 : "尚未登记声纹"}
                             </small>
                           </div>
-                          {m.id === active.member_id ? (
-                            <button
-                              className="secondary"
-                              onClick={() => setModal("voice")}
-                            >
-                              {voice ? "重新登记" : "登记声纹"}
-                            </button>
+                          {m.id === active.member_id ||
+                          (host && m.role === "attendee") ? (
+                            <div className="member-actions">
+                              <button
+                                className="secondary"
+                                disabled={
+                                  pending ||
+                                  snapshot.runtime.busy ||
+                                  snapshot.runtime.recording ||
+                                  snapshot.meeting.status === "ended"
+                                }
+                                onClick={() => {
+                                  setVoiceTarget(
+                                    m.id === active.member_id ? null : m,
+                                  );
+                                  setVoiceBlob(null);
+                                  setVoiceSeconds(0);
+                                  setModal("voice");
+                                }}
+                              >
+                                {voice ? "重新登记" : "登记声纹"}
+                              </button>
+                              {host && m.role === "attendee" && voice && (
+                                <>
+                                  {voice.enabled && (
+                                    <button
+                                      className="text-button"
+                                      disabled={
+                                        pending || snapshot.runtime.busy
+                                      }
+                                      onClick={() =>
+                                        void perform(() =>
+                                          api(
+                                            path +
+                                              `/members/${m.id}/voiceprint`,
+                                            active,
+                                            { enabled: false },
+                                            "PATCH",
+                                          ),
+                                        )
+                                      }
+                                    >
+                                      撤回使用
+                                    </button>
+                                  )}
+                                  <button
+                                    className="text-button danger"
+                                    disabled={pending || snapshot.runtime.busy}
+                                    onClick={() =>
+                                      void perform(async () => {
+                                        await api(
+                                          path + `/members/${m.id}/voiceprint`,
+                                          active,
+                                          undefined,
+                                          "DELETE",
+                                        );
+                                        setNotice(`${m.name}的声纹档案已删除`);
+                                      })
+                                    }
+                                  >
+                                    删除声纹
+                                  </button>
+                                </>
+                              )}
+                            </div>
                           ) : voice?.enabled ? (
                             <span className="pill green">
                               <Check size={13} />
@@ -1728,9 +1817,47 @@ export default function App() {
           </form>
         </Modal>
       )}
+      {modal === "attendee" && (
+        <Modal title="添加现场参会者" onClose={() => setModal(null)}>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const form = new FormData(e.currentTarget);
+              void perform(async () => {
+                await api(path + "/members", active, {
+                  name: form.get("name"),
+                  consent: form.get("consent") === "true",
+                });
+                setModal(null);
+                setNotice("参会者已添加，可以在名单中登记其声纹");
+              });
+            }}
+          >
+            <p className="modal-description">
+              无需手机或登录。填写姓名后即可进入本场名单；声纹需要另行登记。每场最多12人，包含主持人和通过设备加入的人。
+            </p>
+            <label>
+              参会者姓名
+              <input
+                name="name"
+                required
+                maxLength={30}
+                placeholder="例如：张三"
+              />
+            </label>
+            <label className="checkbox">
+              <input type="checkbox" name="consent" value="true" required />
+              我已告知本人会议将记录音频和文字，并取得同意。
+            </label>
+            <button className="primary full" disabled={pending}>
+              确认添加
+            </button>
+          </form>
+        </Modal>
+      )}
       {modal === "voice" && (
         <Modal
-          title="登记我的声纹"
+          title={voiceTarget ? `登记${voiceTarget.name}的声纹` : "登记我的声纹"}
           onClose={() => {
             void stopVoice();
             setModal(null);
@@ -1738,7 +1865,7 @@ export default function App() {
         >
           <form onSubmit={(e) => void submitEnroll(e)}>
             <p className="modal-description">
-              请在安静环境朗读10～20秒。每人使用自己的加入身份登记，重录会替换原有声纹。
+              请让被登记者本人在安静环境朗读10～20秒，其他人保持安静。重录会替换该参会者原有声纹；登记音频不长期保留。
             </p>
             <div className="read-prompt">
               “大家好，我来介绍一下今天的讨论计划。我们先回顾上周的进展，再确认下一步需要完成的工作。遇到不确定的问题，可以一起交流。”
@@ -1756,7 +1883,9 @@ export default function App() {
                   ? `结束录音 · ${voiceSeconds}s`
                   : voiceBlob
                     ? "重新录制"
-                    : "录制我的声音"}
+                    : voiceTarget
+                      ? "录制参会者的声音"
+                      : "录制我的声音"}
               </button>
               {voiceBlob && (
                 <span className="green-text">
@@ -1766,7 +1895,7 @@ export default function App() {
               )}
             </div>
             <label>
-              或者上传1～3段本人的音频文件
+              或者上传1～3段被登记者本人的音频文件
               <input
                 type="file"
                 name="file"
@@ -1777,7 +1906,9 @@ export default function App() {
             </label>
             <label className="checkbox">
               <input type="checkbox" name="consent" value="true" required />
-              我同意将自己的声纹保存在主电脑，并用于本场会议匹配。我可以随时撤回或删除。
+              {voiceTarget
+                ? `我已取得${voiceTarget.name}本人同意，将其声纹保存在主电脑并用于本场会议匹配；可按本人要求撤回或删除。`
+                : "我同意将自己的声纹保存在主电脑，并用于本场会议匹配。我可以随时撤回或删除。"}
             </label>
             <button
               className="primary full"

@@ -46,6 +46,11 @@ class Join(Strict):
     consent: Literal[True]
 
 
+class Attendee(Strict):
+    name: str = Field(min_length=1, max_length=30)
+    consent: Literal[True]
+
+
 class Utterance(Strict):
     text: str = Field(min_length=1, max_length=4000)
     speaker: str = Field(default="未标注", min_length=1, max_length=40)
@@ -231,6 +236,18 @@ def create_app(settings=None, agent=None, speech=None):
         await publish(result["meeting_id"])
         return result
 
+    @app.post("/api/meetings/{mid}/members")
+    async def add_attendee(mid: str, body: Attendee, current=Depends(host)):
+        result = store.add_attendee(mid, body.name)
+        await publish(mid)
+        return result
+
+    def managed_attendee(mid, ident):
+        result = store.attendee(mid, ident)
+        if result is None:
+            raise HTTPException(404, "本场未找到由主持人添加的参会者")
+        return result
+
     @app.get("/api/meetings/{mid}")
     def snapshot(mid: str, current=Depends(member)):
         return public(mid)
@@ -316,6 +333,20 @@ def create_app(settings=None, agent=None, speech=None):
     async def enroll(
         mid: str, consent: bool = Form(...), file: list[UploadFile] = File(...), current=Depends(member)
     ):
+        return await enroll_for(mid, current, consent, file)
+
+    @app.post("/api/meetings/{mid}/members/{ident}/voiceprint")
+    async def enroll_attendee(
+        mid: str,
+        ident: str,
+        consent: bool = Form(...),
+        file: list[UploadFile] = File(...),
+        current=Depends(host),
+    ):
+        return await enroll_for(mid, managed_attendee(mid, ident), consent, file)
+
+    async def enroll_for(mid, target, consent, file):
+        require_ready(mid)
         if not consent:
             raise ValueError("登记声纹需要本人确认")
         if not speech.available()["speaker"]:
@@ -331,7 +362,7 @@ def create_app(settings=None, agent=None, speech=None):
             vectors = [await speech.run("enroll", content) for content in contents]
             vector = np.mean(vectors, axis=0)
             vector = vector / max(float(np.linalg.norm(vector)), 1e-9)
-            store.enroll(mid, current["id"], current["name"], vector.tolist(), settings.speaker_path.name)
+            store.enroll(mid, target["id"], target["name"], vector.tolist(), settings.speaker_path.name)
         finally:
             r.busy = False
             await publish(mid)
@@ -346,6 +377,26 @@ def create_app(settings=None, agent=None, speech=None):
     @app.delete("/api/meetings/{mid}/voiceprint")
     async def voice_delete(mid: str, current=Depends(member)):
         store.voice_change(mid, current["id"])
+        await publish(mid)
+        return {"ok": True}
+
+    @app.patch("/api/meetings/{mid}/members/{ident}/voiceprint")
+    async def revoke_attendee_voice(mid: str, ident: str, body: VoiceChange, current=Depends(host)):
+        managed_attendee(mid, ident)
+        if room(mid).busy:
+            raise HTTPException(409, "请等待正在处理的任务完成后撤回声纹")
+        if body.enabled:
+            raise ValueError("重新启用需要本人同意后重新登记")
+        store.voice_change(mid, ident, False)
+        await publish(mid)
+        return {"ok": True}
+
+    @app.delete("/api/meetings/{mid}/members/{ident}/voiceprint")
+    async def delete_attendee_voice(mid: str, ident: str, current=Depends(host)):
+        managed_attendee(mid, ident)
+        if room(mid).busy:
+            raise HTTPException(409, "请等待正在处理的任务完成后删除声纹")
+        store.voice_change(mid, ident)
         await publish(mid)
         return {"ok": True}
 

@@ -1991,3 +1991,20 @@ small {
     display: none;
   }
 }
+
+.member-row > .member-actions {
+  flex: 0 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 600px) {
+  .member-row {
+    flex-wrap: wrap;
+  }
+  .member-row > .member-actions {
+    flex-basis: 100%;
+  }
+}

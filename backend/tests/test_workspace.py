@@ -283,3 +283,82 @@ def test_confirmed_actions_include_current_source_evidence(setup):
     assert result["confirmed_actions"][0]["text"] == "周五完成测试"
     assert result["utterances"][0]["id"] == ident
     assert ident in tools.visible
+
+
+def test_host_manages_device_free_attendees_with_consent_and_isolation(setup):
+    client, app, host, path, headers = setup
+    code = client.get(path, headers=headers).json()["meeting"]["code"]
+    guest = client.post("/api/join", json={"code": code, "name": "手机用户", "consent": True}).json()
+    gh = {"Authorization": "Bearer " + guest["token"]}
+    payload = {"name": "现场张三", "consent": True}
+    assert client.post(path + "/members", headers=gh, json=payload).status_code == 403
+    assert (
+        client.post(path + "/members", headers=headers, json={**payload, "consent": False}).status_code == 422
+    )
+    with client.websocket_connect("/ws/meetings/" + host["meeting_id"]) as ws:
+        ws.send_json({"token": guest["token"]})
+        ws.receive_json()
+        response = client.post(path + "/members", headers=headers, json=payload)
+        assert response.status_code == 200
+        attendee = response.json()
+        assert attendee["role"] == "attendee" and "token" not in attendee
+        assert ws.receive_json()["data"]["members"][-1]["id"] == attendee["id"]
+    assert client.post(path + "/members", headers=headers, json=payload).status_code == 400
+    vp = path + "/members/" + attendee["id"] + "/voiceprint"
+    files = {"file": ("enroll.wav", wav_bytes(np.ones(64000, dtype=np.float32) * 0.1))}
+    for auth, consent, expected in [(gh, "true", 403), (headers, "false", 400), (headers, "true", 200)]:
+        assert client.post(vp, headers=auth, data={"consent": consent}, files=files).status_code == expected
+    assert (
+        client.post(
+            path + "/members/" + guest["member_id"] + "/voiceprint",
+            headers=headers,
+            data={"consent": "true"},
+            files=files,
+        ).status_code
+        == 404
+    )
+    other = app.state.store.create("另一场", "另一个主持人")
+    foreign = app.state.store.add_attendee(other["meeting_id"], "他人")
+    assert (
+        client.post(
+            path + "/members/" + foreign["id"] + "/voiceprint",
+            headers=headers,
+            data={"consent": "true"},
+            files=files,
+        ).status_code
+        == 404
+    )
+    snap = client.get(path, headers=gh).json()
+    assert snap["voiceprints"][0]["member_id"] == attendee["id"]
+    assert "embedding" not in snap["voiceprints"][0]
+    assert "token_hash" not in snap["members"][-1]
+    # The participant and their voiceprint survive a store reopen, with no raw enrollment recording.
+    reopened = Store(app.state.settings.data_dir)
+    assert reopened.attendee(host["meeting_id"], attendee["id"])["name"] == "现场张三"
+    assert reopened.voice_candidates(host["meeting_id"])[0]["name"] == "现场张三"
+    assert not list(app.state.settings.data_dir.rglob("*.wav"))
+    assert client.patch(vp, headers=gh, json={"enabled": False}).status_code == 403
+    assert client.delete(vp, headers=gh).status_code == 403
+    assert client.patch(vp, headers=headers, json={"enabled": False}).status_code == 200
+    assert reopened.voice_candidates(host["meeting_id"]) == []
+    assert client.patch(vp, headers=headers, json={"enabled": True}).status_code == 400
+    assert client.delete(vp, headers=headers).status_code == 200
+    assert client.get(path, headers=headers).json()["voiceprints"] == []
+    for i in range(9):
+        assert (
+            client.post(
+                path + "/members", headers=headers, json={"name": f"现场{i}", "consent": True}
+            ).status_code
+            == 200
+        )
+    assert (
+        client.post(path + "/members", headers=headers, json={"name": "超额", "consent": True}).status_code
+        == 400
+    )
+    assert client.post("/api/join", json={"code": code, "name": "超额", "consent": True}).status_code == 400
+    assert client.post(path + "/end", headers=headers).status_code == 200
+    assert client.post(vp, headers=headers, data={"consent": "true"}, files=files).status_code == 409
+    assert (
+        client.post(path + "/members", headers=headers, json={"name": "会后", "consent": True}).status_code
+        == 400
+    )

@@ -71,3 +71,9 @@ AI答案直接保存为 `answers`，不要把TTS音频重新转录成 `utterance
 - [faster-whisper：CPU 推理、PyAV 解码与词时间戳](https://github.com/SYSTRAN/faster-whisper)
 - [sherpa-onnx 声纹提取示例](https://github.com/k2-fsa/sherpa-onnx/blob/master/python-api-examples/speaker-identification.py)
 - [sherpa-onnx 关键词检测示例](https://github.com/k2-fsa/sherpa-onnx/blob/master/python-api-examples/keyword-spotter.py)
+
+## 无设备的现场参会者
+
+主持人可直接添加 `attendee` 角色，确认本人已同意会议记录。该身份没有发放给浏览器的登录令牌，使用已有成员表即可兼容历史数据库。普通参会者不能代管他人的声纹；主持人只可通过专用接口代管本场现场添加的成员，不能覆盖其他浏览器成员的自主登记。所有成员共用每场12人的名额。
+
+为现场成员登记声纹时需单独确认本人授权，支持主电脑录音和上传1～3段音频，使用与自主登记相同的模型和短窗口匹配流程。名单和声纹状态经WebSocket同步。声纹向量保存在本机，原始登记音频不长期保留；会议录音仍按原流程保存。撤回后再次使用需重新取得同意并登记。

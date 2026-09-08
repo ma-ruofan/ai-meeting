@@ -125,7 +125,7 @@ class Store:
                 db.execute("SELECT count(*) FROM members WHERE meeting_id=?", (meeting["id"],)).fetchone()[0]
                 >= 12
             ):
-                raise ValueError("个人版每场最多 12 个连接身份")
+                raise ValueError("个人版每场最多 12 位参会者")
             token, member = secrets.token_urlsafe(32), uid()
             db.execute(
                 "INSERT INTO members VALUES(?,?,?,?,?,?)",
@@ -139,6 +139,33 @@ class Store:
             "role": "guest",
             "title": meeting["title"],
         }
+
+    def add_attendee(self, mid, name):
+        # No login credential is issued for people attending without a device.
+        ident = uid()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            meeting = db.execute("SELECT status FROM meetings WHERE id=?", (mid,)).fetchone()
+            if not meeting or meeting["status"] == "ended":
+                raise ValueError("会议已结束或不存在")
+            if db.execute("SELECT count(*) FROM members WHERE meeting_id=?", (mid,)).fetchone()[0] >= 12:
+                raise ValueError("个人版每场最多 12 位参会者")
+            if db.execute("SELECT id FROM members WHERE meeting_id=? AND name=?", (mid, name)).fetchone():
+                raise ValueError("已有同名参会者，请添加称呼以便区分")
+            db.execute(
+                "INSERT INTO members VALUES(?,?,?,?,?,?)",
+                (ident, mid, name, "attendee", digest(secrets.token_urlsafe(32)), time.time()),
+            )
+            self.event(db, mid, "member.added_by_host")
+        return {"id": ident, "name": name, "role": "attendee"}
+
+    def attendee(self, mid, ident):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT id,name,role FROM members WHERE meeting_id=? AND id=? AND role='attendee'",
+                (mid, ident),
+            ).fetchone()
+            return dict(row) if row else None
 
     def auth(self, mid, token):
         with self.connect() as db:
