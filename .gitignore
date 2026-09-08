@@ -36,3 +36,10 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Browser application
+node_modules/
+frontend/dist/
+playwright-report/
+test-results/
+*.tsbuildinfo
