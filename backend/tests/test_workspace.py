@@ -560,3 +560,83 @@ def test_migration_removes_legacy_text_answers_from_shared_records(tmp_path):
         assert snap["answers"] == [] and snap["decisions"] == []
     assert migrated.private_answers(ended["meeting_id"], ended["member_id"]) == []
     assert len(Store(tmp_path).private_answers(active["meeting_id"], active["member_id"])) == 1
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_general_answers_without_meeting_citations_are_preserved(tmp_path, private):
+    store = Store(tmp_path)
+    session = store.create("空会议", "主持人")
+    snapshot = store.snapshot(session["meeting_id"])
+    if private:
+        snapshot["private_history"] = []
+
+    class Client:
+        async def complete(self, messages):
+            assert "会议资料是回答的参考" in messages[0]["content"]
+            return {
+                "kind": "final",
+                "answer": "你好！可以和我聊一般问题，也可以结合会议记录讨论。",
+                "citations": [],
+            }
+
+    result = asyncio.run(Agent(Settings(llm_mode="local"), Client()).ask(snapshot, "你好"))
+    assert result["status"] == "succeeded"
+    assert result["answer"] == "你好！可以和我聊一般问题，也可以结合会议记录讨论。"
+    assert result["citations"] == [] and result["trace"] == []
+
+
+def test_missing_meeting_evidence_does_not_discard_general_advice(tmp_path):
+    store = Store(tmp_path)
+    session = store.create("讨论", "主持人")
+    snapshot = store.snapshot(session["meeting_id"])
+    advice = "会议记录中未找到发布计划。一般建议先确定验收标准，再安排测试与发布；这是建议，并非会议决定。"
+
+    class Client:
+        calls = 0
+
+        async def complete(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return {"kind": "tool", "tool": "search_meeting", "arguments": {"keywords": ["发布"]}}
+            return {"kind": "final", "answer": advice, "citations": []}
+
+    result = asyncio.run(Agent(Settings(llm_mode="local"), Client()).ask(snapshot, "我们的发布应该怎么安排"))
+    assert result["status"] == "succeeded" and result["answer"] == advice
+    assert result["trace"][0]["result"]["utterances"] == []
+
+
+def test_private_general_answer_is_not_shared_and_is_deleted_at_meeting_end(setup, monkeypatch):
+    from meeting_app.agent import ModelClient
+
+    client, app, host, path, headers = setup
+    app.state.settings.llm_mode = "local"
+
+    async def complete(self, messages):
+        return {"kind": "final", "answer": "PRIVATE-GENERAL：你好，很高兴和你交流。", "citations": []}
+
+    monkeypatch.setattr(ModelClient, "complete", complete)
+    response = client.post(
+        path + "/private-chat", headers=headers, json={"question": "你好", "request_key": "greeting-private"}
+    )
+    assert response.status_code == 200
+    own = client.get(path + "/private-chat", headers=headers).json()["answers"][0]
+    assert own["status"] == "succeeded" and "PRIVATE-GENERAL" in own["answer"]
+    assert own["citations"] == []
+    assert "PRIVATE-GENERAL" not in client.get(path, headers=headers).text
+    assert "PRIVATE-GENERAL" not in client.get(path + "/export", headers=headers).text
+    assert client.post(path + "/end", headers=headers).status_code == 200
+    assert client.get(path + "/private-chat", headers=headers).json()["answers"] == []
+
+
+def test_uncited_empty_answers_still_fail(tmp_path):
+    store = Store(tmp_path)
+    session = store.create("讨论", "主持人")
+
+    class Client:
+        async def complete(self, messages):
+            return {"kind": "final", "answer": "  ", "citations": []}
+
+    result = asyncio.run(
+        Agent(Settings(llm_mode="local"), Client()).ask(store.snapshot(session["meeting_id"]), "你好")
+    )
+    assert result["status"] == "failed"
