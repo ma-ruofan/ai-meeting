@@ -130,13 +130,34 @@ uv run --project backend --extra voice --extra dev --frozen python scripts/start
 | 变量 | 默认 / 含义 |
 |---|---|
 | `XIAOK_LLM_MODE` | `mock`；以后选择 `local` 或 `api` |
+| `XIAOK_LLM_BACKEND` | `auto`；本机11434端口自动使用Ollama原生接口，或指定 `ollama` / `chat-completions` |
 | `XIAOK_LLM_URL` | 兼容 Chat Completions 的服务基地址，通常以 `/v1` 结尾 |
 | `XIAOK_LLM_MODEL` | 真实模型名称 |
 | `XIAOK_LLM_KEY` | 可选；只在服务端使用 |
 | `XIAOK_MODEL_DIR` | 本地语音模型目录 |
 | `XIAOK_DATA_DIR` | 数据目录 |
 
-当前实现为经过校验的 JSON 工具协议：模型输出调用对象，服务端执行并回传，最终输出带引用的答案。模型不需要原生 function calling，但必须能稳定按提示输出 JSON。非兼容协议需新增适配器。默认每次问答最多3次工具执行、4轮模型请求，总计100秒；不静默重复付费请求。真实模型效果、上下文预算和协议兼容性待选型后验证。
+当前实现为经过校验的 JSON 工具协议：模型输出调用对象，服务端执行并回传，最终输出带引用的答案。模型不需要原生 function calling，但必须能稳定按提示输出 JSON。非兼容协议需新增适配器。默认每次问答最多3次工具执行、4轮模型请求，本地模式总计300秒、API模式100秒；单次模型请求的生成等待分别为120秒和45秒，连接限时10秒；不自动重试。真实模型效果、上下文预算和协议兼容性待选型后验证。
+
+### Windows 本地 Ollama
+
+先在Ollama应用中确认模型能独立回复，再在启动会议服务的同一个PowerShell窗口设置（模型名以下用已有的 `gemma4:e4b` 举例，不代表适用于所有硬件）：
+
+```powershell
+$env:XIAOK_LLM_MODE = "local"
+$env:XIAOK_LLM_BACKEND = "ollama"
+$env:XIAOK_LLM_URL = "http://127.0.0.1:11434/v1"
+$env:XIAOK_LLM_MODEL = "gemma4:e4b"
+$env:XIAOK_LLM_KEY = ""
+python scripts/check_model.py
+python scripts/start.py
+```
+
+`check_model.py`只发送一次合成JSON测试，不读取会议数据；模型应用自身不能回答时，应先排查模型加载、硬件资源和Ollama日志。脚本成功只说明连接和JSON格式可用，不能代替真实会议Agent评测。
+
+Ollama适配会将该基地址转换为 `/api/chat`，设置 `format=json`、`think=false`、`stream=false`；不强制覆盖Ollama的上下文长度配置。回环地址直接连接，不使用为模型下载配置的HTTP代理。llama.cpp和其他兼容服务继续使用Chat Completions接口；普通API请求不自动增加Ollama专属参数。
+
+新错误码区分：`LLM_CONNECT`连接失败、`LLM_TIMEOUT`超时、`LLM_HTTP_404`模型或接口不存在、`LLM_HTTP_500`模型服务内部错误、`LLM_EMPTY`没有最终答案、`LLM_TRUNCATED`输出被截断、`LLM_JSON`最终答案不是JSON、`LLM_RESPONSE`接口响应结构不符。不会在错误提示中显示模型服务的原始响应、密钥或会议内容。单个完整JSON代码块可解析，带任意前后说明文字的答案仍拒绝。
 
 ## 开发与验证
 

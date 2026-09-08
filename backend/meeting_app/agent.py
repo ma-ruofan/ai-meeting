@@ -5,6 +5,7 @@ import json
 import re
 from time import perf_counter
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -86,31 +87,123 @@ PRIVATE_SYSTEM = (
 
 
 class ModelClient:
-    def __init__(self, settings):
+    def __init__(self, settings, transport=None):
         self.settings = settings
+        self.transport = transport
+
+    def connection(self):
+        s = self.settings
+        if s.llm_mode not in {"local", "api"} or not s.llm_url or not s.llm_model:
+            raise ValueError("[LLM_CONFIG] 尚未配置真实模型，请设置 XIAOK_LLM_MODE/URL/MODEL")
+        try:
+            url = urlsplit(s.llm_url.rstrip("/"))
+            port = url.port
+        except ValueError:
+            raise ValueError("[LLM_CONFIG] 模型服务地址格式不正确") from None
+        if url.scheme not in {"http", "https"} or not url.hostname or url.query or url.fragment:
+            raise ValueError("[LLM_CONFIG] 请填写HTTP服务基地址，不含查询参数或片段")
+        loopback = url.hostname in {"localhost", "127.0.0.1", "::1"}
+        if s.llm_backend not in {"auto", "ollama", "chat-completions"}:
+            raise ValueError("[LLM_CONFIG] XIAOK_LLM_BACKEND应为auto、ollama或chat-completions")
+        ollama = s.llm_backend == "ollama" or (
+            s.llm_backend == "auto" and s.llm_mode == "local" and loopback and port == 11434
+        )
+        path = url.path.rstrip("/")
+        if ollama:
+            if path.endswith("/v1"):
+                path = path[:-3]
+            if not path.endswith("/api/chat"):
+                path = path.removesuffix("/api") + "/api/chat"
+        else:
+            path += "/chat/completions"
+        return urlunsplit((url.scheme, url.netloc, path, "", "")), ollama, loopback
 
     async def complete(self, messages):
         s = self.settings
-        if s.llm_mode not in {"local", "api"} or not s.llm_url or not s.llm_model:
-            raise ValueError("尚未配置真实模型，请设置 XIAOK_LLM_MODE/URL/MODEL；当前可用模拟模式")
+        endpoint, ollama, loopback = self.connection()
         headers = {"Authorization": f"Bearer {s.llm_key}"} if s.llm_key else {}
+        payload = {"model": s.llm_model, "messages": messages, "stream": False}
+        if ollama:
+            # Request structured output and final content without a thinking-token budget competing with it.
+            payload.update(
+                format="json",
+                think=False,
+                options={"temperature": 0.1, "num_predict": 1800},
+            )
+        else:
+            payload.update(temperature=0.1, max_tokens=1800)
         try:
-            async with httpx.AsyncClient(timeout=45, follow_redirects=False) as client:
-                response = await client.post(
-                    s.llm_url.rstrip("/") + "/chat/completions",
-                    headers=headers,
-                    json={"model": s.llm_model, "messages": messages, "temperature": 0.1, "max_tokens": 1800},
-                )
+            # Loopback requests must reach the local model instead of an HTTP_PROXY configured for downloads.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(s.llm_timeout, connect=10),
+                follow_redirects=False,
+                trust_env=not loopback,
+                transport=self.transport,
+            ) as client:
+                response = await client.post(endpoint, headers=headers, json=payload)
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
-                if not isinstance(content, str) or len(content) > 20000:
-                    raise ValueError("模型输出为空或过长")
-                return json.loads(content)
-        except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as exc:
-            # Do not expose URLs, headers or upstream response bodies to clients.
+        except httpx.TimeoutException:
             raise ValueError(
-                "模型调用失败或未返回合法JSON，请检查本机模型配置；没有自动重试付费请求"
-            ) from exc
+                f"[LLM_TIMEOUT] 模型连接或生成超时（连接限时10秒，生成等待{s.llm_timeout}秒）。请检查模型加载状态、硬件负载；可先在模型应用中预热。未自动重试。"
+            ) from None
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            hints = {
+                400: "模型服务拒绝请求参数，请检查模型对JSON输出和think参数的支持",
+                401: "模型服务鉴权失败，请检查密钥",
+                403: "模型服务拒绝访问，请检查权限或代理",
+                404: "未找到模型或接口，请核对模型完整名称、服务地址和接口类型",
+                429: "模型服务限流或繁忙，请稍后再试",
+            }
+            hint = hints.get(
+                code,
+                "模型服务内部错误，请查看Ollama或模型服务自身日志"
+                if code >= 500
+                else "模型服务返回异常状态，请检查地址及服务配置",
+            )
+            raise ValueError(f"[LLM_HTTP_{code}] {hint}。未自动重试。") from None
+        except httpx.RequestError:
+            raise ValueError(
+                "[LLM_CONNECT] 无法连接模型服务，请确认Ollama已启动、端口正确且Python可以访问。未自动重试。"
+            ) from None
+        try:
+            data = response.json()
+        except (ValueError, UnicodeError):
+            raise ValueError(
+                "[LLM_RESPONSE] 模型接口返回的不是JSON响应，可能访问了网页或代理错误页"
+            ) from None
+        try:
+            if ollama:
+                if data.get("error"):
+                    raise ValueError("[LLM_RESPONSE] Ollama返回错误，请查看模型服务日志")
+                content, reason = data["message"]["content"], data.get("done_reason")
+            else:
+                choice = data["choices"][0]
+                content, reason = choice["message"]["content"], choice.get("finish_reason")
+        except (KeyError, TypeError, IndexError, AttributeError):
+            raise ValueError("[LLM_RESPONSE] 响应缺少预期的回答字段，请检查接口类型与服务版本") from None
+        if reason == "length":
+            raise ValueError(
+                "[LLM_TRUNCATED] 模型用尽输出预算，答案被截断。请使用非思考模式或更适合结构化输出的模型"
+            )
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("[LLM_EMPTY] 模型未返回最终答案，可能仅返回了思考内容；请检查模型模式及输出预算")
+        if len(content) > 20000:
+            raise ValueError("[LLM_JSON] 模型答案超过长度上限")
+        content = content.strip()
+        # Accept a single fenced JSON object, but never extract JSON from arbitrary surrounding prose.
+        fenced = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        if fenced:
+            content = fenced.group(1).strip()
+        try:
+            result = json.loads(content)
+        except (ValueError, RecursionError):
+            raise ValueError(
+                "[LLM_JSON] 已连接模型，但答案不是合法JSON。Ollama请使用XIAOK_LLM_BACKEND=ollama；其他服务请核对结构化输出能力"
+            ) from None
+        if not isinstance(result, dict):
+            raise ValueError("[LLM_JSON] 模型返回的JSON必须是对象，不能是数组或普通字符串")
+        return result
 
 
 class Tools:
@@ -209,7 +302,7 @@ class Agent:
         started = perf_counter()
         mock = self.settings.llm_mode == "mock"
         try:
-            async with asyncio.timeout(100):
+            async with asyncio.timeout(self.settings.agent_timeout):
                 for step in range(4):
                     if mock:
                         if step == 0:
@@ -296,7 +389,9 @@ class Agent:
                         raise ValueError("上下文达到上限，请缩小问题范围")
         except (ValueError, TimeoutError) as exc:
             return {
-                "answer": str(exc) if not isinstance(exc, TimeoutError) else "问答超时，请稍后重试",
+                "answer": str(exc)
+                if not isinstance(exc, TimeoutError)
+                else "[LLM_TOTAL_TIMEOUT] 问答总等待时间已达上限，请检查模型速度或缩小问题范围",
                 "citations": [],
                 "trace": trace
                 + [{"error": "run_failed", "elapsed_ms": round((perf_counter() - started) * 1000)}],

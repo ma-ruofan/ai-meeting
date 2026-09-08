@@ -16,11 +16,21 @@ class Settings:
     llm_url: str = field(default_factory=lambda: os.getenv("XIAOK_LLM_URL", ""))
     llm_model: str = field(default_factory=lambda: os.getenv("XIAOK_LLM_MODEL", ""))
     llm_key: str = field(default_factory=lambda: os.getenv("XIAOK_LLM_KEY", ""))
+    llm_backend: str = field(default_factory=lambda: os.getenv("XIAOK_LLM_BACKEND", "auto"))
+
     asr_model: str = field(default_factory=lambda: os.getenv("XIAOK_ASR_MODEL", "base"))
     speaker_threshold: float = 0.65
     speaker_margin: float = 0.10
     max_upload: int = 50 * 1024 * 1024
     max_seconds: int = 30 * 60
+
+    @property
+    def llm_timeout(self):
+        return 120 if self.llm_mode == "local" else 45
+
+    @property
+    def agent_timeout(self):
+        return 300 if self.llm_mode == "local" else 100
 
     @property
     def speaker_path(self):
