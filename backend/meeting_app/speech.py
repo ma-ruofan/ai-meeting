@@ -10,8 +10,10 @@ from pathlib import Path
 
 import av
 import numpy as np
+from opencc import OpenCC
 
 CACHE = {}
+SIMPLIFIED = OpenCC("t2s")
 
 
 def decode_audio(content, max_seconds=1800):
@@ -157,6 +159,10 @@ def infer(task, options):
             ]
             if words:
                 result.append({"start": start, "end": end, "text": "".join(words).strip(), "match": match})
+    # Normalize assembled text before either persistence or voice-question handling.
+    # Keep word timing and speaker labels independent of Chinese script conversion.
+    for row in result:
+        row["text"] = SIMPLIFIED.convert(row["text"])
     return {"segments": result, "duration": len(samples) / 16000}
 
 
